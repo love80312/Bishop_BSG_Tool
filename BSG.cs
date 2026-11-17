@@ -1,4 +1,4 @@
-﻿using SixLabors.ImageSharp;
+using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats.Png;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
@@ -9,49 +9,268 @@ using System.Text;
 
 namespace Bishop_BSG_Tool
 {
-    class BSG
+    internal static class BSG
     {
-        static readonly byte[] Signature = Encoding.ASCII.GetBytes("BSS-Graphics\x00\x00\x00\x00");
+        private static readonly byte[] Signature = Encoding.ASCII.GetBytes("BSS-Graphics\x00\x00\x00\x00");
+        private const int HeaderSize = 0x40;
+        private const int BppTypeOffset = 0x30;
+        private const byte Bpp32Type = 0;
+        private const byte Bpp8Type = 2;
+
+        private sealed class BsgHeader
+        {
+            public int Width { get; init; }
+            public int Height { get; init; }
+            public byte BppType { get; init; }
+            public byte CompressionMethod { get; init; }
+            public int DataPosition { get; init; }
+            public int DataLength { get; init; }
+        }
+
+        /// <summary>Reads the BPP type from the BSG header: 8 or 32.</summary>
+        public static int GetBpp(string sourcePath)
+        {
+            BsgHeader header = ReadHeader(sourcePath);
+            return header.BppType == Bpp8Type ? 8 : 32;
+        }
+
+        /// <summary>
+        /// Automatically selects BPP8 for an 8-bit grayscale PNG;
+        /// other supported 32-bit PNG images are written as BPP32.
+        /// </summary>
+        public static void CreateAuto(string filePath, string sourcePath)
+        {
+            var sourceInfo = Image.Identify(sourcePath, out var sourceFormat);
+            if (sourceInfo == null || sourceFormat == null || sourceFormat.Name != "PNG")
+                throw new InvalidDataException("Automatic BPP detection only supports PNG files.");
+
+            var pngMetadata = sourceInfo.Metadata.GetPngMetadata();
+            if (pngMetadata.BitDepth == PngBitDepth.Bit8 && pngMetadata.ColorType == PngColorType.Grayscale)
+            {
+                Console.WriteLine("Detected PNG format: 8-bit grayscale -> BPP8");
+                CreateBpp8(filePath, sourcePath);
+                return;
+            }
+
+            Console.WriteLine("Detected PNG format: trying BPP32");
+            Create(filePath, sourcePath);
+        }
 
         public static void Create(string filePath, string sourcePath)
         {
-            // Load source image file
-
-            var source = Image.Load(sourcePath);
+            using var source = Image.Load(sourcePath);
 
             if (source.PixelType.BitsPerPixel != 32)
-            {
-                throw new Exception("Only 32-bit image file are supported.");
-            }
+                throw new InvalidDataException("BPP32 conversion requires a 32-bit image (for example, an 8-bit-per-channel RGBA PNG).");
 
-            // Copy pixel data
+            if (source.Width <= 0 || source.Height <= 0 || source.Width > ushort.MaxValue || source.Height > ushort.MaxValue)
+                throw new InvalidDataException("Image dimensions are outside the supported BSG range (1..65535).");
 
-            var image = source.CloneAs<Bgra32>();
+            long unpackedSizeLong = (long)source.Width * source.Height * 4;
+            if (unpackedSizeLong > int.MaxValue)
+                throw new InvalidDataException("Image pixel data is too large for the BSG format.");
 
-            // Flip image
-
+            using var image = source.CloneAs<Bgra32>();
             image.Mutate(x => x.Flip(FlipMode.Vertical));
 
-            // Header information
+            int unpackedSize = (int)unpackedSizeLong;
+            ushort imageWidth = checked((ushort)image.Width);
+            ushort imageHeight = checked((ushort)image.Height);
 
-            var unpackedSize = image.Width * image.Height * 4;
-
-            var imageWidth = Convert.ToUInt16(image.Width);
-            var imageHeight = Convert.ToUInt16(image.Height);
-
-            // Create file
+            byte[] pixelData = new byte[unpackedSize];
+            int offset = 0;
+            for (int y = 0; y < image.Height; y++)
+            {
+                var row = image.GetPixelRowSpan(y);
+                for (int x = 0; x < image.Width; x++)
+                {
+                    uint packed = row[x].PackedValue;
+                    pixelData[offset++] = (byte)packed;
+                    pixelData[offset++] = (byte)(packed >> 8);
+                    pixelData[offset++] = (byte)(packed >> 16);
+                    pixelData[offset++] = (byte)(packed >> 24);
+                }
+            }
 
             using var stream = File.Create(filePath);
             using var writer = new BinaryWriter(stream);
 
-            // Write file header
+            WriteHeader(writer, imageWidth, imageHeight, unpackedSize, Bpp32Type);
+            Compression.RleCompress(writer, pixelData, 4);
+            UpdateDataLength(writer, stream);
+        }
 
+        public static void CreateBpp8(string filePath, string sourcePath)
+        {
+            var sourceInfo = Image.Identify(sourcePath, out var sourceFormat);
+            if (sourceInfo == null || sourceFormat == null || sourceFormat.Name != "PNG")
+                throw new InvalidDataException("BPP8 conversion only supports PNG files.");
+
+            var pngMetadata = sourceInfo.Metadata.GetPngMetadata();
+            if (pngMetadata.BitDepth != PngBitDepth.Bit8 || pngMetadata.ColorType != PngColorType.Grayscale)
+                throw new InvalidDataException("BPP8 conversion requires an 8-bit grayscale PNG.");
+
+            if (sourceInfo.Width <= 0 || sourceInfo.Height <= 0 || sourceInfo.Width > short.MaxValue || sourceInfo.Height > short.MaxValue)
+                throw new InvalidDataException("BPP8 image dimensions must be between 1 and 32767.");
+
+            long bufferSizeLong = (long)sourceInfo.Width * sourceInfo.Height;
+            if (bufferSizeLong > int.MaxValue)
+                throw new InvalidDataException("Image pixel data is too large for the BSG format.");
+
+            using var image = Image.Load<L8>(sourcePath);
+            image.Mutate(x => x.Flip(FlipMode.Vertical));
+
+            int bufferSize = (int)bufferSizeLong;
+            byte[] pixels = new byte[bufferSize];
+            int offset = 0;
+            for (int y = 0; y < image.Height; y++)
+            {
+                var row = image.GetPixelRowSpan(y);
+                for (int x = 0; x < image.Width; x++)
+                    pixels[offset++] = row[x].PackedValue;
+            }
+
+            using var stream = File.Create(filePath);
+            using var writer = new BinaryWriter(stream);
+
+            WriteHeader(writer, checked((ushort)image.Width), checked((ushort)image.Height), bufferSize, Bpp8Type);
+            Compression.RleCompress(writer, pixels, 1);
+            UpdateDataLength(writer, stream);
+        }
+
+        public static void ExtractAuto(string filePath, string sourcePath)
+        {
+            ExtractCore(filePath, sourcePath, expectedBpp: 0);
+        }
+
+        public static void ExtractBpp8(string filePath, string sourcePath)
+        {
+            ExtractCore(filePath, sourcePath, expectedBpp: 8);
+        }
+
+        public static void ExtractBpp32(string filePath, string sourcePath)
+        {
+            ExtractCore(filePath, sourcePath, expectedBpp: 32);
+        }
+
+        private static void ExtractCore(string filePath, string sourcePath, int expectedBpp)
+        {
+            BsgHeader header = ReadHeader(sourcePath);
+            int actualBpp = header.BppType == Bpp8Type ? 8 : 32;
+
+            if (expectedBpp != 0 && expectedBpp != actualBpp)
+                throw new InvalidDataException($"The BSG header identifies this file as BPP{actualBpp}, not BPP{expectedBpp}.");
+
+            int bytesPerPixel = actualBpp == 8 ? 1 : 4;
+            int expectedLength = checked(header.Width * header.Height * bytesPerPixel);
+            byte[] encodedData;
+
+            using (var stream = File.OpenRead(sourcePath))
+            using (var reader = new BinaryReader(stream))
+            {
+                stream.Position = header.DataPosition;
+                encodedData = reader.ReadBytes(header.DataLength);
+            }
+
+            if (encodedData.Length != header.DataLength)
+                throw new InvalidDataException("The BSG image data is truncated.");
+
+            byte[] pixels;
+            switch (header.CompressionMethod)
+            {
+                case 0:
+                    pixels = encodedData;
+                    if (pixels.Length != expectedLength)
+                        throw new InvalidDataException($"Uncompressed pixel data length is {pixels.Length}; expected {expectedLength}.");
+                    break;
+
+                case 1:
+                    pixels = new byte[expectedLength];
+                    Compression.RleUncompress(encodedData, pixels, 0, bytesPerPixel);
+                    break;
+
+                default:
+                    throw new NotSupportedException($"BSG compression method {header.CompressionMethod} is not supported. Supported methods are RAW (0) and RLE (1).");
+            }
+
+            if (actualBpp == 8)
+            {
+                using var image = Image.LoadPixelData<L8>(pixels, header.Width, header.Height);
+                image.Mutate(x => x.Flip(FlipMode.Vertical));
+                image.SaveAsPng(filePath, new PngEncoder
+                {
+                    BitDepth = PngBitDepth.Bit8,
+                    ColorType = PngColorType.Grayscale
+                });
+            }
+            else
+            {
+                using var image = Image.LoadPixelData<Bgra32>(pixels, header.Width, header.Height);
+                image.Mutate(x => x.Flip(FlipMode.Vertical));
+                image.SaveAsPng(filePath, new PngEncoder
+                {
+                    BitDepth = PngBitDepth.Bit8,
+                    ColorType = PngColorType.RgbWithAlpha
+                });
+            }
+        }
+
+        private static BsgHeader ReadHeader(string sourcePath)
+        {
+            if (string.IsNullOrWhiteSpace(sourcePath))
+                throw new ArgumentException("A source file path is required.", nameof(sourcePath));
+
+            using var stream = File.OpenRead(sourcePath);
+            using var reader = new BinaryReader(stream);
+
+            if (stream.Length < HeaderSize)
+                throw new InvalidDataException("The file is too small to contain a complete BSG header.");
+
+            byte[] signature = reader.ReadBytes(Signature.Length);
+            if (!signature.SequenceEqual(Signature))
+                throw new InvalidDataException("Not a valid BSS-Graphics BSG file.");
+
+            stream.Position = 0x16;
+            int width = reader.ReadUInt16();
+            int height = reader.ReadUInt16();
+
+            stream.Position = BppTypeOffset;
+            byte bppType = reader.ReadByte();
+            byte compressionMethod = reader.ReadByte();
+            int dataPosition = reader.ReadInt32();
+            int dataLength = reader.ReadInt32();
+
+            if (width <= 0 || height <= 0)
+                throw new InvalidDataException("The BSG header contains invalid image dimensions.");
+
+            if (bppType != Bpp8Type && bppType != Bpp32Type)
+                throw new NotSupportedException($"Unsupported BSG BPP type: 0x{bppType:X2}. Expected 0x00 (BPP32) or 0x02 (BPP8).");
+
+            if (dataPosition < HeaderSize || dataLength < 0 || (long)dataPosition + dataLength > stream.Length)
+                throw new InvalidDataException("The BSG header contains an invalid pixel-data offset or length.");
+
+            if (compressionMethod != 0 && compressionMethod != 1)
+                throw new NotSupportedException($"BSG compression method {compressionMethod} is not supported.");
+
+            return new BsgHeader
+            {
+                Width = width,
+                Height = height,
+                BppType = bppType,
+                CompressionMethod = compressionMethod,
+                DataPosition = dataPosition,
+                DataLength = dataLength
+            };
+        }
+
+        private static void WriteHeader(BinaryWriter writer, ushort width, ushort height, int unpackedSize, byte bppType)
+        {
             writer.Write(Signature);
             writer.WriteByte(0);
             writer.WriteByte(1);
-            writer.WriteInt32(unpackedSize);    // unpacked size
-            writer.WriteUInt16(imageWidth);     // width
-            writer.WriteUInt16(imageHeight);    // height
+            writer.WriteInt32(unpackedSize);
+            writer.WriteUInt16(width);
+            writer.WriteUInt16(height);
             writer.WriteInt32(0x10);
             writer.WriteUInt16(0);
 
@@ -59,331 +278,35 @@ namespace Bishop_BSG_Tool
             writer.WriteUInt16(0); // offset y
             writer.WriteUInt16(0);
             writer.WriteUInt16(0);
-            writer.WriteUInt16(imageWidth);     // width
-            writer.WriteUInt16(imageHeight);    // height
+            writer.WriteUInt16(width);
+            writer.WriteUInt16(height);
             writer.WriteByte(0);
             writer.WriteByte(1);
             writer.WriteUInt16(0);
 
-            writer.WriteByte(0);        // image type, 0 - bgra32, 1 - bgr32, 2 - indexed
-            writer.WriteByte(1);        // compression method, 0 - none, 1 - rle, 2 - lz
-            writer.WriteInt32(0x40);    // data offset
-            writer.WriteInt32(0);       // packed size
-            writer.WriteInt32(0);       // palette offset, 0 - none
+            writer.WriteByte(bppType); // 0 = BGRA32, 2 = indexed/grayscale BPP8
+            writer.WriteByte(1);       // RLE compression
+            writer.WriteInt32(HeaderSize);
+            writer.WriteInt32(0);      // compressed data length, updated after compression
+            writer.WriteInt32(0);      // palette offset; no palette
             writer.WriteByte(0);
-            writer.WriteByte(2);
+            writer.WriteByte(bppType == Bpp32Type ? (byte)2 : (byte)0);
 
-            // Pack pixel data
+            if (writer.BaseStream.Position != HeaderSize)
+                throw new InvalidDataException("Internal error: BSG header size is not 0x40 bytes.");
+        }
 
-            var memStream = new MemoryStream(unpackedSize);
-            var memWriter = new BinaryWriter(memStream);
+        private static void UpdateDataLength(BinaryWriter writer, Stream stream)
+        {
+            long endPosition = stream.Position;
+            long dataLength = endPosition - HeaderSize;
+            if (dataLength < 0 || dataLength > int.MaxValue)
+                throw new InvalidDataException("Compressed BSG image data is too large.");
 
-            for (var y = 0; y < image.Height; y++)
-            {
-                var row = image.GetPixelRowSpan(y);
-
-                for (var x = 0; x < image.Width; x++)
-                {
-                    memWriter.Write(row[x].PackedValue);
-                }
-            }
-
-            var pixelData = memStream.ToArray();
-
-            // Compress and write out pixel data
-
-            var dataOffset = stream.Position;
-
-            Compression.RleCompress(writer, pixelData, 4);
-
-            // Update file header
-
-            var dataSize = Convert.ToUInt32(stream.Position - dataOffset);
             stream.Position = 0x36;
-            writer.Write(dataSize);
-
-            // Done
-
+            writer.Write((int)dataLength);
+            stream.Position = endPosition;
             writer.Flush();
         }
-
-        public static void ExtractBpp8(string filePath, string sourcePath)
-        {
-            using var stream = File.OpenRead(sourcePath);
-            using var reader = new BinaryReader(stream);
-
-            // File Header
-            var signature = reader.ReadBytes(16);
-
-            if (!signature.SequenceEqual(Signature))
-            {
-                throw new Exception("Not a valid BSG image file.");
-            }
-
-            reader.ReadByte();      // This value is 1 when 'compression method' is greater than or equal to 2
-            reader.ReadByte();      // Always is 1
-            reader.ReadInt32();     // Length of uncompressed pixel data
-            int width = reader.ReadUInt16();    // Width
-            int height = reader.ReadUInt16();   // Height
-            reader.ReadInt32();     // Always is 16
-            reader.ReadByte();      // Unused, always is 0
-            reader.ReadByte();      // Unused, always is 0
-
-            // Image Description
-            reader.ReadInt16();     // Always is 0, maybe offset X of this clip?
-            reader.ReadInt16();     // Always is 0, maybe offset Y of this clip?
-            reader.ReadInt16();     // Always is 0, unknow
-            reader.ReadInt16();     // Always is 0, unknow
-            reader.ReadInt16();     // Width
-            reader.ReadInt16();     // Height
-            reader.ReadByte();      // Always is 0
-            reader.ReadByte();      // Always is 1
-            reader.ReadInt16();     // Always is 0
-
-            // Data Description
-            int bppType = reader.ReadByte();            // BPP type, 0 - BPP32, 1 - BPP24, 2 - BPP8
-            int compressionMethod = reader.ReadByte();  // Compression method, 0 - NONE, 1 - RLE, 2 - LZ
-            int dataPosition = reader.ReadInt32();      // Position of compressed pixel data
-            int dataLength = reader.ReadInt32();        // Length of compressed pixel data
-            reader.ReadInt32();     // Position of palette pixel data
-            reader.ReadByte();      // Always is 0
-            reader.ReadByte();      // Always is 0
-
-            if (bppType != 2)
-            {
-                throw new Exception("This method only supports BPP8 format.");
-            }
-
-            reader.BaseStream.Position = dataPosition;
-
-            var pixels = Array.Empty<byte>();
-
-            switch (compressionMethod)
-            {
-                case 0:
-                {
-                    pixels = reader.ReadBytes(dataLength);
-                    break;
-                }
-                case 1:
-                {
-                    var data = reader.ReadBytes(dataLength);
-                    pixels = new byte[width * height];
-                    Compression.RleUncompress(data, pixels, 0, 1);
-                    break;
-                }
-                default:
-                {
-                    throw new Exception("This method only supports RAW and RLE compression methods.");
-                }
-            }
-
-            if (pixels.Length != width * height)
-            {
-                throw new Exception("No pixels were read.");
-            }
-
-            var image = Image.LoadPixelData<L8>(pixels, width, height);
-
-            image.Mutate(x => x.Flip(FlipMode.Vertical));
-
-            var pngEncoder = new PngEncoder
-            {
-                BitDepth = PngBitDepth.Bit8,
-                ColorType = PngColorType.Grayscale
-            };
-
-            image.SaveAsPng(filePath, pngEncoder);
-
-            stream.Close();
-            stream.Dispose();
-        }
-
-        public static void CreateBpp8(string filePath, string sourcePath)
-        {
-            var sourceInfo = Image.Identify(sourcePath, out var sourceFormat);
-
-            if (sourceInfo == null || sourceFormat == null || sourceFormat.Name != "PNG")
-            {
-                throw new Exception("This method only supports PNG format.");
-            }
-
-            var pngMetadata = sourceInfo.Metadata.GetPngMetadata();
-
-            if (pngMetadata.BitDepth != PngBitDepth.Bit8)
-            {
-                throw new Exception("This method only supports BPP8 format.");
-            }
-
-            if (pngMetadata.ColorType != PngColorType.Grayscale)
-            {
-                throw new Exception("This method only supports BPP8 format.");
-            }
-
-            var image = Image.Load<L8>(sourcePath);
-
-            if (image.Width > short.MaxValue || image.Height > short.MaxValue)
-            {
-                throw new Exception("This image is too large.");
-            }
-
-            image.Mutate(x => x.Flip(FlipMode.Vertical));
-
-            var bufferSize = image.Width * image.Height;
-
-            var memStream = new MemoryStream(bufferSize);
-            var memWriter = new BinaryWriter(memStream);
-
-            for (var y = 0; y < image.Height; y++)
-            {
-                var row = image.GetPixelRowSpan(y);
-
-                for (var x = 0; x < image.Width; x++)
-                {
-                    memWriter.Write(row[x].PackedValue);
-                }
-            }
-
-            var pixels = memStream.ToArray();
-
-            using var stream = File.Create(filePath);
-            using var writer = new BinaryWriter(stream);
-
-            writer.Write(Signature);
-            writer.WriteByte(0);    // This value is 1 when 'compression method' is greater than or equal to 2
-            writer.WriteByte(1);    // Always is 1
-            writer.WriteInt32(bufferSize);  // Length of uncompressed pixel data
-            writer.WriteInt16(Convert.ToInt16(image.Width));    // Width
-            writer.WriteInt16(Convert.ToInt16(image.Height));   // Height
-            writer.WriteInt32(16);  // Always is 16
-            writer.WriteByte(0);    // Unused, always is 0
-            writer.WriteByte(0);    // Unused, always is 0
-
-            // Image Description
-            writer.WriteInt16(0);   // Always is 0, maybe offset X of this clip?
-            writer.WriteInt16(0);   // Always is 0, maybe offset Y of this clip?
-            writer.WriteInt16(0);   // Always is 0, unknow
-            writer.WriteInt16(0);   // Always is 0, unknow
-            writer.WriteInt16(Convert.ToInt16(image.Width));    // Width
-            writer.WriteInt16(Convert.ToInt16(image.Height));   // Height
-            writer.WriteByte(0);     // Always is 0
-            writer.WriteByte(1);     // Always is 1
-            writer.WriteInt16(0);    // Always is 0
-
-            // Data Description
-            writer.WriteByte(2);    // BPP type, 0 - BPP32, 1 - BPP24, 2 - BPP8
-            writer.WriteByte(1);    // Compression method, 0 - NONE, 1 - RLE, 2 - LZ
-            writer.WriteInt32(0x40);    // Position of compressed pixel data
-            writer.WriteInt32(0);   // Length of compressed pixel data
-            writer.WriteInt32(0);   // Position of palette pixel data, 0 - No palette
-            writer.WriteByte(0);    // Always is 0
-            writer.WriteByte(0);    // Always is 0
-
-            var dataPosition = stream.Position;
-
-            Compression.RleCompress(writer, pixels, 1);
-
-            var dataLength = Convert.ToUInt32(stream.Position - dataPosition);
-            stream.Position = 0x36;
-            writer.Write(dataLength);
-
-            writer.Flush();
-            writer.Close();
-            writer.Dispose();
-        }
-
-        public static void ExtractBpp32(string filePath, string sourcePath)
-        {
-            using var stream = File.OpenRead(sourcePath);
-            using var reader = new BinaryReader(stream);
-
-            // File Header
-            var signature = reader.ReadBytes(16);
-
-            if (!signature.SequenceEqual(Signature))
-            {
-                throw new Exception("Not a valid BSG image file.");
-            }
-
-            reader.ReadByte();      // Some flags
-            reader.ReadByte();      // Always 1
-            reader.ReadInt32();     // Length of uncompressed pixel data
-            int width = reader.ReadUInt16();
-            int height = reader.ReadUInt16();
-            reader.ReadInt32();     // Always 16
-            reader.ReadByte();      // 0
-            reader.ReadByte();      // 0
-
-            // Image Description
-            reader.ReadInt16();     // 0
-            reader.ReadInt16();     // 0
-            reader.ReadInt16();     // 0
-            reader.ReadInt16();     // 0
-            reader.ReadInt16();     // Width (again)
-            reader.ReadInt16();     // Height (again)
-            reader.ReadByte();      // 0
-            reader.ReadByte();      // 1
-            reader.ReadInt16();     // 0
-
-            // Data Description
-            int bppType = reader.ReadByte();
-            int compressionMethod = reader.ReadByte();
-            int dataPosition = reader.ReadInt32();
-            int dataLength = reader.ReadInt32();
-            reader.ReadInt32();     // Position of palette pixel data
-            reader.ReadByte();      // 0
-            reader.ReadByte();      // 0
-
-            if (bppType != 0) // 0 means BPP32
-            {
-                throw new Exception("This method only supports BPP32 format.");
-            }
-
-            reader.BaseStream.Position = dataPosition;
-
-            byte[] pixels;
-
-            switch (compressionMethod)
-            {
-                case 0: // No compression
-                {
-                    pixels = reader.ReadBytes(dataLength);
-                    break;
-                }
-                case 1: // RLE compression
-                {
-                    var data = reader.ReadBytes(dataLength);
-                    pixels = new byte[width * height * 4]; // 4 bytes per pixel
-                    Compression.RleUncompress(data, pixels, 0, 4); // 4-byte stride
-                    break;
-                }
-                default:
-                {
-                    throw new Exception("This method only supports RAW and RLE compression methods.");
-                }
-            }
-
-            if (pixels.Length != width * height * 4)
-            {
-                throw new Exception("No pixels were read.");
-            }
-
-            // Load pixel data as BGRA32 (32Bit color)
-            var image = Image.LoadPixelData<Bgra32>(pixels, width, height);
-
-            image.Mutate(x => x.Flip(FlipMode.Vertical));
-
-            var pngEncoder = new PngEncoder
-            {
-                BitDepth = PngBitDepth.Bit8,
-                ColorType = PngColorType.RgbWithAlpha
-            };
-
-            image.SaveAsPng(filePath, pngEncoder);
-
-            stream.Close();
-            stream.Dispose();
-        }
-
     }
 }
