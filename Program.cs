@@ -9,6 +9,74 @@ namespace Bishop_BSG_Tool
     {
         private static int Main(string[] args)
         {
+            if (args.Length == 0)
+            {
+                PrintUsage();
+                return 2;
+            }
+
+            string mode = args[0].Trim().ToLowerInvariant();
+
+            try
+            {
+                switch (mode)
+                {
+                    case "-x":
+                        if (args.Length != 2 && args.Length != 3)
+                        {
+                            PrintUsage();
+                            return 2;
+                        }
+
+                        string archivePath = Path.GetFullPath(args[1]);
+                        string outputDirectory = args.Length == 3
+                            ? Path.GetFullPath(args[2])
+                            : Path.Combine(
+                                Path.GetDirectoryName(archivePath) ?? Environment.CurrentDirectory,
+                                Path.GetFileNameWithoutExtension(archivePath));
+
+                        BSA.Extract(archivePath, outputDirectory);
+                        return 0;
+
+                    case "-a":
+                        if (args.Length != 3)
+                        {
+                            PrintUsage();
+                            return 2;
+                        }
+
+                        BSA.Pack(Path.GetFullPath(args[1]), Path.GetFullPath(args[2]));
+                        return 0;
+
+                    case "-v":
+                        if (args.Length != 2)
+                        {
+                            PrintUsage();
+                            return 2;
+                        }
+
+                        BSA.Verify(Path.GetFullPath(args[1]));
+                        return 0;
+
+                    case "-c":
+                    case "-e":
+                        return RunBsgMode(args);
+
+                    default:
+                        Console.Error.WriteLine("錯誤：不支援的模式。\n");
+                        PrintUsage();
+                        return 2;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"執行失敗：{ex.Message}");
+                return 1;
+            }
+        }
+
+        private static int RunBsgMode(string[] args)
+        {
             if (args.Length != 3)
             {
                 PrintUsage();
@@ -17,13 +85,6 @@ namespace Bishop_BSG_Tool
 
             string mode = args[0].Trim().ToLowerInvariant();
             string bppMode = args[1].Trim().ToLowerInvariant();
-
-            if (mode != "-c" && mode != "-e")
-            {
-                Console.Error.WriteLine("錯誤：模式只能使用 -c（PNG 轉 BSG）或 -e（BSG 轉 PNG）。");
-                PrintUsage();
-                return 2;
-            }
 
             if (bppMode != "-auto" && bppMode != "-bpp8" && bppMode != "-bpp32")
             {
@@ -150,8 +211,20 @@ namespace Bishop_BSG_Tool
 
         private static void PrintUsage()
         {
-            Console.WriteLine("Bishop BSG Tool");
-            Console.WriteLine("用法：");
+            Console.WriteLine("Bishop BSG / BSA Tool");
+            Console.WriteLine();
+            Console.WriteLine("BSA 封包：");
+            Console.WriteLine("  BSA 解包：Bishop_BSG_Tool -x [archive.bsa] [output_folder]");
+            Console.WriteLine("  BSA 打包：Bishop_BSG_Tool -a [input_folder] [output.bsa]");
+            Console.WriteLine("  BSA 驗證：Bishop_BSG_Tool -v [archive.bsa]");
+            Console.WriteLine();
+            Console.WriteLine("  -x  自動辨識 BSA v1/v2/v3；未指定資料夾時，輸出至同名資料夾。");
+            Console.WriteLine("  -a  有 .bsa_manifest.json 時保留原始版本及索引順序；沒有時建立 v3。");
+            Console.WriteLine("  -v  檢查標頭、索引、檔名、資料範圍及檔案資料可讀性。");
+            Console.WriteLine("  BSA 檔名使用 CP932（日文 Shift-JIS）；檔案內容以原始位元組複製。");
+            Console.WriteLine("  打包會先寫入暫存檔，通過索引解析及所有檔案 SHA-256 比對後才替換輸出檔。");
+            Console.WriteLine();
+            Console.WriteLine("BSG 圖片：");
             Console.WriteLine("  PNG 轉 BSG：Bishop_BSG_Tool -c [-auto|-bpp8|-bpp32] [image.png|folder]");
             Console.WriteLine("  BSG 轉 PNG：Bishop_BSG_Tool -e [-auto|-bpp8|-bpp32] [image.bsg|folder]");
             Console.WriteLine();
@@ -163,7 +236,7 @@ namespace Bishop_BSG_Tool
             Console.WriteLine("自動判斷規則：");
             Console.WriteLine("  BSG 解包：讀取 BSG 標頭 0x30 位移的 BPP 類型欄位。");
             Console.WriteLine("  PNG 打包：8-bit 灰階 PNG 判定為 BPP8；其他圖片嘗試以 BPP32 處理。");
-            Console.WriteLine("  資料夾模式只處理該資料夾第一層的 PNG 或 BSG 檔案。");
+            Console.WriteLine("  BSG 資料夾模式只處理該資料夾第一層的 PNG 或 BSG 檔案。");
         }
     }
 }

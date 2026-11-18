@@ -1,9 +1,81 @@
+# Bishop BSG / BSA Tool
 
-# Bishop BSG Tool
+Bishop 引擎 BSS-Graphics（BSG）圖片轉換，以及 BSA 封包解包、修改後重新打包工具。
 
-PNG 與 Bishop 引擎 BSS-Graphics（BSG）圖片轉換工具。
+## BSA 使用方式
 
-## 使用方式
+```text
+Bishop_BSG_Tool -x [archive.bsa] [output_folder]
+Bishop_BSG_Tool -a [input_folder] [output.bsa]
+Bishop_BSG_Tool -v [archive.bsa]
+```
+
+### 解包
+
+```bat
+Bishop_BSG_Tool -x embed.bsa
+Bishop_BSG_Tool -x embed.bsa embed_unpacked
+```
+
+- 自動辨識 BSA v1、v2、v3。
+- 未指定輸出資料夾時，解包至 BSA 同目錄下的同名資料夾。
+- 解包目標必須不存在或為空資料夾，避免覆蓋既有檔案。
+- 解包會產生隱藏中繼資料 `.bsa_manifest.json`，請勿刪除；重新打包時會用它保留原始版本、索引記錄順序、原始檔名字節及目錄標記。
+
+### 修改後重新打包
+
+```bat
+Bishop_BSG_Tool -a embed_unpacked embed_modified.bsa
+```
+
+以專案內的 `test\embed.bsa` 為例：
+
+```bat
+Bishop_BSG_Tool -x test\embed.bsa test\embed_unpacked
+```
+
+修改 `test\embed_unpacked\boot.lua` 後：
+
+```bat
+Bishop_BSG_Tool -a test\embed_unpacked test\embed_modified.bsa
+Bishop_BSG_Tool -v test\embed_modified.bsa
+```
+
+- 保留原始 BSA 版本：v1 解包後仍打包為 v1，v2 保持 v2，v3 保持 v3。
+- 原有檔案依中繼資料的原始索引順序寫入；新增檔案附加在原有記錄之後；已刪除檔案不再寫入。
+- 修改檔案時，保持相同相對路徑與檔名即可替換內容。
+- 支援遞迴子資料夾。原始空資料夾會透過中繼資料保留。
+- 新增檔案會以 CP932 編碼檔名，並建立必要的目錄標記。
+- 沒有 `.bsa_manifest.json` 時，會將資料夾內容建立成新的 BSA v3。
+- BSA v1 的檔名欄位固定 32 bytes；超出長度會報錯，不會截斷。
+
+### 自動驗證
+
+打包時不會直接覆蓋目標 BSA：
+
+1. 先寫入同目錄的暫存封包。
+2. 重新解析暫存封包的標頭及索引。
+3. 檢查版本、索引筆數、檔案路徑與資料範圍。
+4. 將每個輸入檔案與封包內對應資料計算 SHA-256。
+5. 全部通過後，才以暫存封包取代目標檔案。
+
+也可以獨立檢查封包：
+
+```bat
+Bishop_BSG_Tool -v embed_modified.bsa
+```
+
+注意：程式內部驗證通過代表 BSA 結構可重新解析、封包資料與來源檔案一致；仍應使用 GARbro 回讀，並在目標遊戲中實際測試，才能確認該遊戲接受此封包。
+
+## BSA 編碼與資料處理
+
+- BSA 內部檔名使用 CP932（日文 Shift-JIS），與 GARbro Bishop `ArcBSA.cs` 的預設讀取方式一致。
+- 若檔名無法以 CP932 表示，打包時會明確報錯；不會把無法表示的字元默默轉成 `?`。
+- Lua、TXT、BSG、PNG 等封包內部檔案只複製原始位元組，不會因為檔名使用 CP932 就轉換檔案內容編碼。
+- 不額外壓縮封包內的檔案資料。
+- 解包會拒絕絕對路徑、`..` 路徑及 Windows 不允許的檔名，避免封包路徑寫出指定資料夾。
+
+## BSG 圖片使用方式
 
 ```text
 Bishop_BSG_Tool -c -auto  [image.png|folder]
@@ -18,12 +90,10 @@ Bishop_BSG_Tool -e -bpp32 [image.bsg|folder]
 - `-auto`：自動判斷格式，建議使用。
 - `-bpp8`：強制使用 BPP8。
 - `-bpp32`：強制使用 BPP32。
-- 資料夾模式只處理資料夾第一層，不會遞迴子資料夾。
+- BSG 資料夾模式只處理資料夾第一層，不會遞迴子資料夾。
 - 輸出檔案會放在來源檔案所在資料夾，並使用相同檔名。
 
-## 自動判斷方式
-
-### BSG 解包
+### BSG 自動判斷方式
 
 BSG 標頭中 `0x30` 位移處是 BPP 類型欄位：
 
@@ -32,30 +102,13 @@ BSG 標頭中 `0x30` 位移處是 BPP 類型欄位：
 | `0x00` | BPP32（BGRA） | 4 bytes |
 | `0x02` | BPP8（灰階／索引資料） | 1 byte |
 
-`-e -auto` 直接讀取這個欄位，不依賴副檔名、檔案大小或肉眼判斷。
-
-### PNG 打包
-
-`-c -auto` 讀取 PNG 內部格式資訊：
-
-- 8-bit Grayscale PNG → BPP8
-- 其他圖片會嘗試以 BPP32 處理；必須是 32-bits-per-pixel 圖片才能成功。
-
-若自動判斷不符合來源圖片格式，可改用 `-bpp8` 或 `-bpp32` 明確指定。
-
-## 修正項目
-
-- BPP32 RLE 會分別解碼四個通道。
-- RLE 壓縮使用有界限的索引運算，避免讀取資料陣列尾端之外的記憶體。
-- RLE 解碼會檢查每個通道的長度、輸出像素數量及截斷資料。
-- BSG 解包會驗證簽章、BPP 欄位、資料偏移、資料長度及壓縮方式。
-- 批次處理會回報成功／失敗數量；只要有檔案失敗，程序結束碼就會是非零。
+- BSG 解包：讀取標頭 BPP 欄位。
+- PNG 打包：8-bit Grayscale PNG 判定為 BPP8；其他圖片嘗試以 BPP32 處理，必須是 32-bits-per-pixel 圖片才能成功。
 
 ## 依賴套件
 
 - SixLabors.ImageSharp 3.1.12
+- System.Text.Encoding.CodePages 8.0.0（CP932 檔名編碼）
 - 目標框架：.NET 8
 
-ImageSharp 3.1.12 不需要授權金鑰。
-
-注意：3.1.12 仍有已公開的安全性公告，不代表已修補所有已知漏洞。此版本先作為免金鑰相容性測試版本，建議只處理可信任來源的 PNG／BSG 檔案。
+ImageSharp 3.1.12 不需要授權金鑰。此版本仍有已公開的安全性公告，建議只處理可信任來源的 PNG／BSG 檔案。
