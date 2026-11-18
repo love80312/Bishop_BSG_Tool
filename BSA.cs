@@ -50,6 +50,18 @@ namespace Bishop_BSG_Tool
             DirectoryEnd
         }
 
+        /// <summary>
+        /// GARbro first tries the compact 12-byte name-table index for BSA v2/v3,
+        /// then falls back to the legacy 40-byte fixed-name index when that fails.
+        /// Keep this separate from the archive version because v2/v3 files can
+        /// still contain the legacy index layout.
+        /// </summary>
+        private enum IndexLayout
+        {
+            FixedNameV1 = 1,
+            NameTableV2 = 2
+        }
+
         private sealed class ArchiveRecord
         {
             public RecordType Type { get; init; }
@@ -65,6 +77,7 @@ namespace Bishop_BSG_Tool
             public ushort Version { get; init; }
             public ushort RecordCount { get; init; }
             public uint IndexOffset { get; init; }
+            public IndexLayout IndexLayout { get; init; }
             public byte[] Header { get; init; } = Array.Empty<byte>();
             public List<ArchiveRecord> Records { get; init; } = new List<ArchiveRecord>();
             public List<ArchiveRecord> Files => Records.Where(x => x.Type == RecordType.File).ToList();
@@ -74,6 +87,8 @@ namespace Bishop_BSG_Tool
         {
             public int ManifestVersion { get; set; } = 1;
             public int ArchiveVersion { get; set; }
+            // 0 means an older manifest without this field; infer from version.
+            public int IndexLayout { get; set; }
             public string HeaderBase64 { get; set; } = string.Empty;
             public string OriginalArchiveName { get; set; } = string.Empty;
             public List<ManifestRecord> Records { get; set; } = new List<ManifestRecord>();
@@ -137,6 +152,7 @@ namespace Bishop_BSG_Tool
             {
                 ManifestVersion = 1,
                 ArchiveVersion = archive.Version,
+                IndexLayout = (int)archive.IndexLayout,
                 HeaderBase64 = Convert.ToBase64String(archive.Header),
                 OriginalArchiveName = Path.GetFileName(archivePath)
             };
@@ -258,6 +274,7 @@ namespace Bishop_BSG_Tool
             string manifestPath = Path.Combine(inputDirectory, ManifestFileName);
             Manifest? manifest = null;
             ushort version = 3;
+            IndexLayout indexLayout = IndexLayout.NameTableV2;
             byte[] header = CreateDefaultHeader();
             var inputFiles = CollectInputFiles(inputDirectory, archivePath, tempArchive);
 
@@ -270,6 +287,24 @@ namespace Bishop_BSG_Tool
                     throw new InvalidDataException($"中繼資料中的 BSA 版本無效：{manifest.ArchiveVersion}");
 
                 version = checked((ushort)manifest.ArchiveVersion);
+                int manifestIndexLayout = manifest.IndexLayout;
+                if (manifestIndexLayout == 0)
+                {
+                    // Backward compatibility with manifests created before the
+                    // index layout was recorded explicitly.
+                    manifestIndexLayout = version == 1
+                        ? (int)IndexLayout.FixedNameV1
+                        : (int)IndexLayout.NameTableV2;
+                }
+
+                if (manifestIndexLayout != (int)IndexLayout.FixedNameV1 &&
+                    manifestIndexLayout != (int)IndexLayout.NameTableV2)
+                    throw new InvalidDataException($"中繼資料中的 BSA 索引格式無效：{manifestIndexLayout}");
+
+                indexLayout = (IndexLayout)manifestIndexLayout;
+                if (version == 1 && indexLayout != IndexLayout.FixedNameV1)
+                    throw new InvalidDataException("BSA v1 必須使用固定長度檔名索引格式。");
+
                 try
                 {
                     header = Convert.FromBase64String(manifest.HeaderBase64);
@@ -308,8 +343,8 @@ namespace Bishop_BSG_Tool
 
             try
             {
-                WriteArchive(tempArchive, version, header, records);
-                VerifyPackedArchive(tempArchive, version, records);
+                WriteArchive(tempArchive, version, indexLayout, header, records);
+                VerifyPackedArchive(tempArchive, version, indexLayout, records);
 
                 // Replace the destination only after the temporary archive passed
                 // structural parsing and byte-for-byte payload verification.
@@ -317,7 +352,10 @@ namespace Bishop_BSG_Tool
 
                 Console.WriteLine();
                 Console.WriteLine($"BSA 打包完成：{Path.GetFileName(archivePath)}");
-                Console.WriteLine($"格式：BSA v{version}；檔案：{records.Count(x => x.Type == RecordType.File):N0}；索引記錄：{records.Count:N0}");
+                string indexDescription = indexLayout == IndexLayout.FixedNameV1
+                    ? "固定檔名索引（40 bytes/筆）"
+                    : "字串表索引（12 bytes/筆）";
+                Console.WriteLine($"格式：BSA v{version}；{indexDescription}；檔案：{records.Count(x => x.Type == RecordType.File):N0}；索引記錄：{records.Count:N0}");
                 if (manifest != null)
                     Console.WriteLine($"沿用原始版本及索引順序；新增：{addedCount:N0}，移除：{removedCount:N0}");
                 else
@@ -341,7 +379,10 @@ namespace Bishop_BSG_Tool
                     _ = ComputeRangeSha256(archivePath, entry.Offset, entry.Size);
             }
 
-            Console.WriteLine($"BSA 驗證通過：版本 v{archive.Version}，檔案 {archive.Files.Count:N0} 個，索引記錄 {archive.RecordCount:N0} 筆。");
+            string indexDescription = archive.IndexLayout == IndexLayout.FixedNameV1
+                ? "固定檔名索引"
+                : "字串表索引";
+            Console.WriteLine($"BSA 驗證通過：版本 v{archive.Version}，{indexDescription}，檔案 {archive.Files.Count:N0} 個，索引記錄 {archive.RecordCount:N0} 筆。");
         }
 
         private static Manifest LoadManifest(string manifestPath)
@@ -658,11 +699,16 @@ namespace Bishop_BSG_Tool
         private static void WriteArchive(
             string outputPath,
             ushort version,
+            IndexLayout indexLayout,
             byte[] originalHeader,
             List<WriteRecord> records)
         {
             if (version < 1 || version > 3)
                 throw new InvalidDataException("只支援建立 BSA v1、v2 或 v3。");
+            if (indexLayout != IndexLayout.FixedNameV1 && indexLayout != IndexLayout.NameTableV2)
+                throw new InvalidDataException("不支援的 BSA 索引格式。");
+            if (version == 1 && indexLayout != IndexLayout.FixedNameV1)
+                throw new InvalidDataException("BSA v1 必須使用固定長度檔名索引格式。");
 
             using var stream = new FileStream(outputPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
             using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
@@ -705,7 +751,7 @@ namespace Bishop_BSG_Tool
             if (indexPosition > uint.MaxValue)
                 throw new InvalidDataException("BSA 索引偏移超過 32-bit 上限。");
 
-            if (version == 1)
+            if (indexLayout == IndexLayout.FixedNameV1)
             {
                 foreach (WriteRecord record in records)
                 {
@@ -758,11 +804,17 @@ namespace Bishop_BSG_Tool
             stream.Flush(flushToDisk: true);
         }
 
-        private static void VerifyPackedArchive(string archivePath, ushort expectedVersion, List<WriteRecord> expectedRecords)
+        private static void VerifyPackedArchive(
+            string archivePath,
+            ushort expectedVersion,
+            IndexLayout expectedIndexLayout,
+            List<WriteRecord> expectedRecords)
         {
             ParsedArchive actual = ReadArchive(archivePath);
             if (actual.Version != expectedVersion)
                 throw new InvalidDataException("打包驗證失敗：輸出 BSA 版本與預期不一致。");
+            if (actual.IndexLayout != expectedIndexLayout)
+                throw new InvalidDataException("打包驗證失敗：輸出 BSA 索引格式與原始封包不一致。");
 
             List<WriteRecord> expectedFiles = expectedRecords.Where(x => x.Type == RecordType.File).ToList();
             List<ArchiveRecord> actualFiles = actual.Files;
@@ -796,7 +848,7 @@ namespace Bishop_BSG_Tool
 
             byte[] header = ReadExactly(reader, HeaderSize);
             if (!header.Take(Signature.Length).SequenceEqual(Signature) || header[5] != 0)
-                throw new InvalidDataException("不是有效的 Bishop BSA 檔案（缺少 BSArc\0 簽章）。");
+                throw new InvalidDataException("不是有效的 Bishop BSA 檔案（缺少 BSArc\\0 簽章）。");
 
             ushort version = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(8, 2));
             short signedCount = BinaryPrimitives.ReadInt16LittleEndian(header.AsSpan(10, 2));
@@ -810,14 +862,68 @@ namespace Bishop_BSG_Tool
             if (indexOffset < HeaderSize || indexOffset >= stream.Length)
                 throw new InvalidDataException("BSA 標頭中的索引偏移無效。");
 
-            long indexBytes = (long)count * (version == 1 ? V1IndexRecordSize : V2IndexRecordSize);
+            // GARbro's BsaOpener follows this exact order: for v2/v3, try the
+            // compact 12-byte index first; if it cannot be parsed, retry using
+            // the legacy 40-byte fixed-name index. Preserve the successful
+            // layout in the manifest so repacking uses the same representation.
+            if (version == 1)
+                return ReadArchiveIndex(stream, reader, header, version, count, indexOffset, IndexLayout.FixedNameV1);
+
+            Exception nameTableError;
+            try
+            {
+                return ReadArchiveIndex(stream, reader, header, version, count, indexOffset, IndexLayout.NameTableV2);
+            }
+            catch (Exception ex) when (IsArchiveFormatException(ex))
+            {
+                nameTableError = ex;
+            }
+
+            try
+            {
+                ParsedArchive fallback = ReadArchiveIndex(
+                    stream, reader, header, version, count, indexOffset, IndexLayout.FixedNameV1);
+                Console.WriteLine($"注意：BSA 標示為 v{version}，但採用 v1 固定長度索引；已依 GARbro 備援規則解析。");
+                return fallback;
+            }
+            catch (Exception fixedNameError) when (IsArchiveFormatException(fixedNameError))
+            {
+                throw new InvalidDataException(
+                    $"BSA v{version} 的索引無法解析。已依序嘗試 v2/v3 字串表索引及 v1 固定長度索引。字串表索引錯誤：{nameTableError.Message}；固定長度索引錯誤：{fixedNameError.Message}",
+                    new AggregateException(nameTableError, fixedNameError));
+            }
+        }
+
+        private static bool IsArchiveFormatException(Exception exception)
+        {
+            return exception is InvalidDataException ||
+                   exception is EndOfStreamException ||
+                   exception is DecoderFallbackException ||
+                   exception is OverflowException ||
+                   exception is ArgumentException;
+        }
+
+        private static ParsedArchive ReadArchiveIndex(
+            FileStream stream,
+            BinaryReader reader,
+            byte[] header,
+            ushort version,
+            ushort count,
+            uint indexOffset,
+            IndexLayout indexLayout)
+        {
+            int indexRecordSize = indexLayout == IndexLayout.FixedNameV1
+                ? V1IndexRecordSize
+                : V2IndexRecordSize;
+            long indexBytes = checked((long)count * indexRecordSize);
             if (indexBytes > stream.Length - indexOffset)
-                throw new InvalidDataException("BSA 索引資料超出檔案範圍。");
+                throw new InvalidDataException(
+                    $"BSA 索引資料超出檔案範圍（{(int)indexLayout} 型索引需要 {indexBytes} bytes）。");
 
             byte[]? namesBuffer = null;
-            long namesStart = (long)indexOffset + indexBytes;
-            if (version > 1)
+            if (indexLayout == IndexLayout.NameTableV2)
             {
+                long namesStart = (long)indexOffset + indexBytes;
                 long namesLength = stream.Length - namesStart;
                 if (namesLength <= 0 || namesLength > int.MaxValue)
                     throw new InvalidDataException("BSA 檔名資料表長度無效或超過支援範圍。");
@@ -837,7 +943,7 @@ namespace Bishop_BSG_Tool
                 uint offset;
                 uint size;
 
-                if (version == 1)
+                if (indexLayout == IndexLayout.FixedNameV1)
                 {
                     byte[] fixedName = ReadExactly(reader, 0x20);
                     int terminator = Array.IndexOf(fixedName, (byte)0);
@@ -926,6 +1032,7 @@ namespace Bishop_BSG_Tool
                 Version = version,
                 RecordCount = count,
                 IndexOffset = indexOffset,
+                IndexLayout = indexLayout,
                 Header = header,
                 Records = records
             };
