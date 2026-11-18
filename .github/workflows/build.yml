@@ -3,7 +3,7 @@ name: Bishop BSG Tool Build
 on:
   push:
     branches:
-      - main
+      - mainxx
   workflow_dispatch:
 
 permissions:
