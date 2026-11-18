@@ -118,7 +118,7 @@ jobs:
             $sourceHash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
             $packedHash = (Get-FileHash -LiteralPath $packed -Algorithm SHA256).Hash
             if ($sourceHash -ne $packedHash) {
-              throw "$Label: unchanged round-trip did not reproduce the original BSA bytes."
+              throw "${Label}: unchanged round-trip did not reproduce the original BSA bytes."
             }
             Write-Host "$Label exact round-trip: PASS"
             return $unpacked
