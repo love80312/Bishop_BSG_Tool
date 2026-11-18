@@ -37,6 +37,129 @@ jobs:
           -p:EnableCompressionInSingleFile=true
           --output publish
 
+      - name: Test BSA round-trip and index fallback
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path (Get-Location) 'publish\Bishop_BSG_Tool.exe'
+          $testRoot = Join-Path $env:RUNNER_TEMP 'BsaRegression'
+          New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
+
+          function Invoke-Tool {
+            param([Parameter(Mandatory = $true)][string[]]$Arguments)
+            & $exe @Arguments | ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -ne 0) {
+              throw "Bishop_BSG_Tool failed ($LASTEXITCODE): $($Arguments -join ' ')"
+            }
+          }
+
+          function New-TestBsa {
+            param(
+              [string]$Path,
+              [int]$Version,
+              [bool]$UseFixedNameIndex,
+              [string]$Name,
+              [string]$PayloadText
+            )
+
+            $payload = [Text.Encoding]::ASCII.GetBytes($PayloadText)
+            $nameBytes = [Text.Encoding]::ASCII.GetBytes($Name)
+            $indexOffset = [uint32](16 + $payload.Length)
+            $header = [byte[]]::new(16)
+            [Array]::Copy([Text.Encoding]::ASCII.GetBytes('BSArc'), $header, 5)
+            $header[8] = [byte]$Version
+            $header[10] = 1
+            [BitConverter]::GetBytes($indexOffset).CopyTo($header, 12)
+
+            $memory = [IO.MemoryStream]::new()
+            $writer = [IO.BinaryWriter]::new($memory)
+            try {
+              $writer.Write($header)
+              $writer.Write($payload)
+
+              if ($UseFixedNameIndex) {
+                if ($nameBytes.Length -gt 32) { throw 'Test filename exceeds BSA v1 fixed name field.' }
+                $fixedName = [byte[]]::new(32)
+                [Array]::Copy($nameBytes, $fixedName, $nameBytes.Length)
+                $writer.Write($fixedName)
+                $writer.Write([uint32]16)
+                $writer.Write([uint32]$payload.Length)
+              }
+              else {
+                $writer.Write([int]0)
+                $writer.Write([uint32]16)
+                $writer.Write([uint32]$payload.Length)
+                $writer.Write($nameBytes)
+                $writer.Write([byte]0)
+              }
+
+              $writer.Flush()
+              [IO.File]::WriteAllBytes($Path, $memory.ToArray())
+            }
+            finally {
+              $writer.Dispose()
+              $memory.Dispose()
+            }
+          }
+
+          function Test-ExactRoundTrip {
+            param([string]$Source, [string]$Label, [int]$ExpectedIndexLayout)
+            $unpacked = Join-Path $testRoot ($Label + '_unpacked')
+            $packed = Join-Path $testRoot ($Label + '_roundtrip.bsa')
+            Invoke-Tool @('-x', $Source, $unpacked)
+
+            $manifest = Get-Content -LiteralPath (Join-Path $unpacked '.bsa_manifest.json') -Raw | ConvertFrom-Json
+            if ([int]$manifest.IndexLayout -ne $ExpectedIndexLayout) {
+              throw "${Label}: expected index layout $ExpectedIndexLayout, got $($manifest.IndexLayout)."
+            }
+
+            Invoke-Tool @('-a', $unpacked, $packed)
+            Invoke-Tool @('-v', $packed)
+            $sourceHash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
+            $packedHash = (Get-FileHash -LiteralPath $packed -Algorithm SHA256).Hash
+            if ($sourceHash -ne $packedHash) {
+              throw "$Label: unchanged round-trip did not reproduce the original BSA bytes."
+            }
+            Write-Host "$Label exact round-trip: PASS"
+            return $unpacked
+          }
+
+          # Repository fixture: normal v3 compact 12-byte name-table index.
+          $fixtureUnpacked = Test-ExactRoundTrip 'test\embed.bsa' 'embed_v3_table' 2
+
+          # Modify an extracted payload, repack, verify, extract again and compare the payload.
+          $modifiedScript = Join-Path $fixtureUnpacked 'boot.lua'
+          [IO.File]::AppendAllText($modifiedScript, "`r`n-- CI modification round-trip test`r`n", [Text.Encoding]::ASCII)
+          $modifiedArchive = Join-Path $testRoot 'embed_modified.bsa'
+          Invoke-Tool @('-a', $fixtureUnpacked, $modifiedArchive)
+          Invoke-Tool @('-v', $modifiedArchive)
+          $modifiedUnpacked = Join-Path $testRoot 'embed_modified_unpacked'
+          Invoke-Tool @('-x', $modifiedArchive, $modifiedUnpacked)
+          $sourceScriptHash = (Get-FileHash -LiteralPath $modifiedScript -Algorithm SHA256).Hash
+          $reExtractedScriptHash = (Get-FileHash -LiteralPath (Join-Path $modifiedUnpacked 'boot.lua') -Algorithm SHA256).Hash
+          if ($sourceScriptHash -ne $reExtractedScriptHash) {
+            throw 'Modified boot.lua did not survive BSA repacking and extraction.'
+          }
+          Write-Host 'Modified payload round-trip: PASS'
+
+          # Standard v1 fixed-name index.
+          $v1 = Join-Path $testRoot 'synthetic_v1.bsa'
+          New-TestBsa $v1 1 $true 'v1.bin' 'BSA v1 fixed-name test payload'
+          [void](Test-ExactRoundTrip $v1 'synthetic_v1' 1)
+
+          # Standard v2 compact name-table index.
+          $v2 = Join-Path $testRoot 'synthetic_v2.bsa'
+          New-TestBsa $v2 2 $false 'v2.bin' 'BSA v2 name-table test payload'
+          [void](Test-ExactRoundTrip $v2 'synthetic_v2' 2)
+
+          # Compatibility case: a v3 header with the legacy v1 fixed-name index.
+          # The compact-index attempt must fail, then the v1 fallback must succeed.
+          $v3Legacy = Join-Path $testRoot 'synthetic_v3_legacy_index.bsa'
+          New-TestBsa $v3Legacy 3 $true 'legacy.bin' 'BSA v3 legacy fixed-name test payload'
+          [void](Test-ExactRoundTrip $v3Legacy 'synthetic_v3_legacy' 1)
+
+          Write-Host 'All BSA regression tests passed.'
+
       - name: Create ZIP
         shell: pwsh
         run: |
