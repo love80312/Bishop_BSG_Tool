@@ -1,4 +1,4 @@
-# Bishop BSG / BSA Tool
+# Bishop BSG / BSA Tool ｜byＡＩ
 
 Bishop 引擎 BSS-Graphics（BSG）圖片轉換，以及 BSA 封包解包、修改後重新打包工具。
 
