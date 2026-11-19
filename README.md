@@ -1,5 +1,5 @@
 
-# Bishop BSG Tool
+# Bishop BSG Tool　｜byＡＩ
 
 PNG 與 Bishop 引擎 BSS-Graphics（BSG）圖片轉換工具。
 
